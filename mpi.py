@@ -1,209 +1,58 @@
 # mpi tools
 import sys
 from mpi4py import MPI
+from make_pickable import function_wrapper
 
-
-
-def map(function, sequence, *args, **kwargs):
-    """Return a list of the results of applying the function in
-    parallel (using mpi4py) to each element in sequence.
-
-    :Arguments:
-        function : python function
-            Function to be called that takes as first argument an element of sequence.
-        sequence : list
-            Sequence of elements supplied to function.
-
-    :Optional:
-        args : tuple
-            Additional constant arguments supplied to function.
-        debug : bool=False
-            Be very verbose (for debugging purposes).
-
-    """
-    rank = MPI.COMM_WORLD.Get_rank()
-
-    if rank == 0:
-        # Controller
-        result = _mpi_controller(sequence, *args, **kwargs)
-        return result
-    else:
-        # Worker
-        _mpi_worker(function, sequence, *args, **kwargs)
-
-def _mpi_controller(sequence, *args, **kwargs):
-    """Controller function that sends each element in sequence to
-    different workers. Handles queueing and job termination.
-
-    :Arguments:
-        sequence : list
-            Sequence of elements supplied to the workers.
-
-    :Optional:
-        args : tuple
-            Additional constant arguments supplied to function.
-        debug : bool=False
-            Be very verbose (for debugging purposes).
-
-    """
-    debug = 'debug' in kwargs
-    if debug:
-        del kwargs['debug']
-
-    rank = MPI.COMM_WORLD.Get_rank()
-    assert rank == 0, "rank has to be 0."
-    proc_name = MPI.Get_processor_name()
-    status = MPI.Status()
-
-    process_list = range(1, MPI.COMM_WORLD.Get_size())
-    workers_done = []
-    results = {}
-    if debug: print "Data:", sequence
-
-    # Instead of distributing the actual elements, we just distribute
-    # the index as the workers already have the sequence. This allows
-    # objects to be used as well.
-    queue = iter(xrange(len(sequence)))
-
-    if debug: print "Controller %i on %s: ready!" % (rank, proc_name)
-
-    # Feed all queued jobs to the childs
-    while(True):
-        status = MPI.Status()
-        # Receive input from workers.
-        try:
-            recv = MPI.COMM_WORLD.recv(source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status)
-        except EOFError:
-            import time
-            print('Having trouble with reciving commands.')
-            time.sleep(5)
             
-        if debug: print "Controller: received tag %i from %s" % (status.tag, status.source)
-
-        if status.tag == 1 or status.tag == 10:
-            # tag 1 codes for initialization.
-            # tag 10 codes for requesting more data.
-            if status.tag == 10: # data received
-                if debug: print "Controller: Job %i completed by %i" % (recv[0], status.source)
-                results[recv[0]] = recv[1] # save back
-
-            # Get next item and send to worker
-            try:
-                task = queue.next()
-                # Send job to worker
-                if debug: print "Controller: Sending task to %i" % status.source
-                MPI.COMM_WORLD.send(task, dest=status.source, tag=10)
-
-            except StopIteration:
-                # Send kill signal
-                if debug:
-                    print "Controller: Task queue is empty"
-                workers_done.append(status.source)
-                MPI.COMM_WORLD.send([], dest=status.source, tag=2)
-
-                # Task queue is empty
-                if len(process_list) == 0:
-                    break
-
-        # Tag 2 codes for a worker exiting.
-        elif status.tag == 2:
-            if recv != []:
-                # Worker seems to have crashed but was nice enough to
-                # send us the item number he has been working on
-                results[recv[0]] = recv[1] # save back
-
-            if debug: print 'Process %i exited, removing.' % status.source
-            process_list.remove(status.source)
-            if debug: print 'Processes left over: ' + str(process_list)
-            # Task queue is empty
-            if len(process_list) == 0:
-                break
-
-        else:
-            print 'Unkown tag %i with msg %s' % (status.tag, str(recv))
-
-    if len(process_list) == 0:
-        if debug: print "All workers done."
-        sorted_results = [results[i] for i in range(len(sequence))]
-        if debug: print sorted_results
-        return sorted_results
-    else:
-        raise IOError("Something went wrong, workers still active")
-        print process_list
-        return False
-
-def _mpi_worker(function, sequence, *args, **kwargs):
-    """Worker that applies function to each element it receives from
-    the controller.
-
-    :Arguments:
-        function : python function
-            Function to be called that takes as first argument an
-            element received from the controller.
-
-    :Optional:
-        args : tuple
-            Additional constant arguments supplied to function.
-        debug : bool=False
-            Be very verbose (for debugging purposes).
-
+class MPIPool(object):
     """
-    debug = 'debug' in kwargs
-    if debug:
-        del kwargs['debug']
+    A pool that distributes tasks over a set of MPI processes. MPI is an
+    API for distributed memory parallelism.
 
-    rank = MPI.COMM_WORLD.Get_rank()
-    assert rank != 0, "rank is 0 which is reserved for the controller."
-    proc_name = MPI.Get_processor_name()
-    status = MPI.Status()
-    if debug: print "Worker %i on %s: ready!" % (rank, proc_name)
+    The pool only support the :func:`map` method at the moment because
+    this is the only functionality that emcee needs. That being said,
+    this pool is fairly general and it could be used for other purposes.
 
-    # Send ready signal
-    MPI.COMM_WORLD.send([{'rank': rank, 'name':proc_name}], dest=0, tag=1)
+    Contributed by `Joe Zuntz <https://github.com/joezuntz>`_.
 
-    # Start main data loop
-    while True:
-        # Wait for element
-        if debug: print "Worker %i on %s: waiting for data" % (rank, proc_name)
-        try:
-            recv = MPI.COMM_WORLD.recv(source=0, tag=MPI.ANY_TAG, status=status)
-        except EOFError:
-            print('Having problems reciveing commands') 
-            import time
-            time.sleep(1)
-        if debug: print "Worker %i on %s: received data, tag: %i" % (rank, proc_name, status.tag)
+    :param comm: (optional)
+        The ``mpi4py`` communicator.
 
-        if status.tag == 2:
-            # Kill signal received
-            if debug: print "Worker %i on %s: recieved kill signal" % (rank, proc_name)
-            MPI.COMM_WORLD.send([], dest=0, tag=2)
-            sys.exit(0)
+    :param debug: (optional)
+        If ``True``, print out a lot of status updates at each step.
 
-        if status.tag == 10:
-            # Call function on received element
-            if debug: print "Worker %i on %s: Calling function %s with %s" % (rank, proc_name, function.__name__, recv)
+    :param loadbalance: (optional)
+        if ``True`` and ntask > Ncpus, tries to loadbalance by sending
+        out one task to each cpu first and then sending out the rest
+        as the cpus get done.
+    """
+    def __init__(self, comm=None, debug=False, loadbalance=False):
+        if MPI is None:
+            raise ImportError("Please install mpi4py")
 
-            try:
-                result = function(sequence[recv], *args, **kwargs)
-            except Exception as e:
-                # Send to master that we are quitting
-                MPI.COMM_WORLD.send((recv, None), dest=0, tag=2)
-                # Reraise exception
-                raise e
+        self.comm = MPI.COMM_WORLD if comm is None else comm
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size() - 1
+        self.debug = debug
+        self.function = _error_function
+        self.loadbalance = loadbalance
+        if self.size == 0:
+            raise ValueError("Tried to create an MPI pool, but there "
+                             "was only one MPI process available. "
+                             "Need at least two.")
 
-            if debug: print("Worker %i on %s: finished job %i" % (rank, proc_name, recv))
-            # Return sequence number and result to controller
-            MPI.COMM_WORLD.send((recv, result), dest=0, tag=10)
-
-class MPIPool_stay_alive(emcee.utils.MPIPool):
-    '''
-    Like emcee pool object, but has own instance of likeihood function.
-    Otherwise I get database problems'''
-
-    def wait(self, lik_fun=None):
+    def is_master(self):
         """
-        If this isn't the master process, wait for instructions.
+        Is the current process the master?
 
+        """
+        return self.rank == 0
+
+    def _wait(self, function=None):
+        """
+        If this isn't the master process, wait for instructions. If you are having
+        a hard time getting your object sent, explicily call this with the function
+        as the argument.
         """
         if self.is_master():
             raise RuntimeError("Master node told to await jobs.")
@@ -224,19 +73,18 @@ class MPIPool_stay_alive(emcee.utils.MPIPool):
 
             # Check if message is special sentinel signaling end.
             # If so, stop.
-            if isinstance(task, emcee.mpi_pool._close_pool_message):
+            if isinstance(task, _close_pool_message):
                 if self.debug:
                     print("Worker {0} told to quit.".format(self.rank))
                 break
 
             # Check if message is special type containing new function
             # to be applied
-            if isinstance(task, emcee.mpi_pool._function_wrapper):
-                # run local copy
-                if lik_fun is None:
-                    self.function = task
+            if isinstance(task, _function_wrapper):
+                if function is None:
+                    self.function = task.function
                 else:
-                    self.function = lik_fun
+                    self.function = function
                 if self.debug:
                     print("Worker {0} replaced its task function: {1}."
                           .format(self.rank, self.function))
@@ -249,3 +97,140 @@ class MPIPool_stay_alive(emcee.utils.MPIPool):
                 print("Worker {0} sending answer {1} with tag {2}."
                       .format(self.rank, result, status.tag))
             self.comm.isend(result, dest=0, tag=status.tag)
+
+    def map(self, function, tasks):
+        """
+        Like the built-in :func:`map` function, apply a function to all
+        of the values in a list and return the list of results.
+
+        :param function:
+            The function to apply to the list.
+
+        :param tasks:
+            The list of elements.
+
+        """
+        ntask = len(tasks)
+
+        # If not the master just wait for instructions.
+        if not self.is_master():
+            self._wait()
+            return
+
+        if function is not self.function:
+            if self.debug:
+                print("Master replacing pool function with {0}."
+                      .format(function))
+
+            self.function = function
+            F = function_wrapper(function)
+
+            # Tell all the workers what function to use.
+            requests = []
+            for i in range(self.size):
+                r = self.comm.isend(F, dest=i + 1)
+                requests.append(r)
+
+            # Wait until all of the workers have responded. See:
+            #       https://gist.github.com/4176241
+            MPI.Request.waitall(requests)
+
+        if (not self.loadbalance) or (ntask <= self.size):
+            # Do not perform load-balancing - the default load-balancing
+            # scheme emcee uses.
+
+            # Send all the tasks off and wait for them to be received.
+            # Again, see the bug in the above gist.
+            requests = []
+            for i, task in enumerate(tasks):
+                worker = i % self.size + 1
+                if self.debug:
+                    print("Sent task {0} to worker {1} with tag {2}."
+                          .format(task, worker, i))
+                r = self.comm.isend(task, dest=worker, tag=i)
+                requests.append(r)
+
+            MPI.Request.waitall(requests)
+
+            # Now wait for the answers.
+            results = []
+            for i in range(ntask):
+                worker = i % self.size + 1
+                if self.debug:
+                    print("Master waiting for worker {0} with tag {1}"
+                          .format(worker, i))
+                result = self.comm.recv(source=worker, tag=i)
+                results.append(result)
+
+            return results
+
+        else:
+            # Perform load-balancing. The order of the results are likely to
+            # be different from the previous case.
+            for i, task in enumerate(tasks[0:self.size]):
+                worker = i+1
+                if self.debug:
+                    print("Sent task {0} to worker {1} with tag {2}."
+                          .format(task, worker, i))
+                # Send out the tasks asynchronously.
+                self.comm.isend(task, dest=worker, tag=i)
+
+            ntasks_dispatched = self.size
+            results = [None]*ntask
+            for itask in range(ntask):
+                status = MPI.Status()
+                # Receive input from workers.
+                result = self.comm.recv(source=MPI.ANY_SOURCE,
+                                        tag=MPI.ANY_TAG, status=status)
+                worker = status.source
+                i = status.tag
+                results[i] = result
+                if self.debug:
+                    print("Master received from worker {0} with tag {1}"
+                          .format(worker, i))
+
+                # Now send the next task to this idle worker (if there are any
+                # left).
+                if ntasks_dispatched < ntask:
+                    task = tasks[ntasks_dispatched]
+                    i = ntasks_dispatched
+                    if self.debug:
+                        print("Sent task {0} to worker {1} with tag {2}."
+                              .format(task, worker, i))
+                    # Send out the tasks asynchronously.
+                    self.comm.isend(task, dest=worker, tag=i)
+                    ntasks_dispatched += 1
+
+            return results
+
+    def bcast(self, *args, **kwargs):
+        """
+        Equivalent to mpi4py :func:`bcast` collective operation.
+        """
+        return self.comm.bcast(*args, **kwargs)
+
+    def close(self):
+        """
+        Just send a message off to all the pool members which contains
+        the special :class:`_close_pool_message` sentinel.
+
+        """
+        if self.is_master():
+            for i in range(self.size):
+                self.comm.isend(_close_pool_message(), dest=i + 1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+            
+
+class _close_pool_message(object):
+    def __repr__(self):
+        return "<Close pool message>"
+
+
+def _error_function(task):
+    raise RuntimeError("Pool was sent tasks before being told what "
+                       "function to apply.")
